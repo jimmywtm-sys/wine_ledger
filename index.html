@@ -18,18 +18,18 @@
         let db = null;
         let auth = null;
         let userId = null;
-        let isAuthReady = false;
+        let isAuthReady = false; // Flag to indicate Firebase is fully initialized and authenticated
 
         let wines = [];
         let transactions = [];
         let wineUnsubscribe = null;
         let transactionUnsubscribe = null;
 
-        // Firestore Paths (Private Data)
-        const WINES_COLLECTION = `artifacts/${appId}/users/`;
-        const TRANSACTIONS_COLLECTION = `artifacts/${appId}/users/`;
-
-        // --- INITIAL WINE DATA FROM PDF ---
+        // --- PATH HELPER FUNCTIONS ---
+        const getWinePath = (uid) => `artifacts/${appId}/users/${uid}/wines`;
+        const getTransactionPath = (uid) => `artifacts/${appId}/users/${uid}/transactions`;
+        
+        // --- INITIAL WINE DATA ---
         const INITIAL_WINES_DATA = [
             { name: "Barroca Prosecco", supplier: "Witie Portal", year: "N/A", cost: 15.50, sellingPrice: 78.00, currentStock: 13.3 },
             { name: "Billecart-Salmon Brut Reserve", supplier: "Ange", year: "2024", cost: 65.00, sellingPrice: 198.00, currentStock: 5.0 },
@@ -56,14 +56,679 @@
         // --- FIREBASE INITIAL DATA SEEDING ---
 
         const saveInitialData = async () => {
-            const wineCollectionRef = collection(db, `${WINES_COLLECTION}${userId}/wines`);
+            const wineCollectionRef = collection(db, getWinePath(userId));
             const batch = writeBatch(db);
 
             INITIAL_WINES_DATA.forEach(wine => {
-                // Generate a new temporary document reference for each wine
                 const newWineRef = doc(wineCollectionRef);
                 const wineData = {
                     ...wine,
+                    createdAt: serverTimestamp(),
+                    lastUpdated: serverTimestamp()
+                };
+                batch.set(newWineRef, wineData);
+            });
+
+            try {
+                await batch.commit();
+                showNotification(`Initial inventory of ${INITIAL_WINES_DATA.length} wines loaded successfully!`, 'bg-blue-500');
+            } catch (error) {
+                console.error("Error seeding initial data:", error);
+                showNotification(`Error seeding initial data: ${error.message}`, 'bg-red-500');
+            }
+        };
+
+        const checkAndSeedData = async () => {
+            if (!userId) return; 
+            const wineCollectionRef = collection(db, getWinePath(userId));
+            try {
+                const snapshot = await getDocs(query(wineCollectionRef, limit(1)));
+                if (snapshot.empty) {
+                    await saveInitialData();
+                }
+            } catch (error) {
+                 console.error("Error checking for initial data:", error);
+            }
+        };
+
+        // --- CORE FIREBASE SETUP ---
+        const initializeFirebase = async () => {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                document.getElementById('db-status').classList.remove('bg-gray-400');
+                document.getElementById('db-status').classList.add('bg-yellow-500');
+                document.getElementById('db-status').textContent = 'Connecting...';
+
+                await new Promise(resolve => {
+                    onAuthStateChanged(auth, async (user) => {
+                        if (user) {
+                            userId = user.uid;
+                        } else {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                                userId = auth.currentUser.uid;
+                            } else {
+                                await signInAnonymously(auth);
+                                userId = auth.currentUser.uid;
+                            }
+                        }
+                        isAuthReady = true;
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                        document.getElementById('db-status').classList.remove('bg-yellow-500');
+                        document.getElementById('db-status').classList.add('bg-green-500');
+                        document.getElementById('db-status').textContent = 'Online';
+                        startRealtimeListeners();
+                        checkAndSeedData(); 
+                        resolve();
+                    });
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization or Auth Failed:", error);
+                document.getElementById('db-status').classList.remove('bg-yellow-500');
+                document.getElementById('db-status').classList.add('bg-red-500');
+                document.getElementById('db-status').textContent = 'Error';
+                showNotification(`Error: Failed to initialize Firebase. Check console for details.`, 'bg-red-500');
+            }
+        };
+
+        const startRealtimeListeners = () => {
+            if (!isAuthReady || !db || !userId) return;
+
+            // 1. Wines Listener
+            const wineQuery = collection(db, getWinePath(userId));
+            if (wineUnsubscribe) wineUnsubscribe();
+            wineUnsubscribe = onSnapshot(wineQuery, (snapshot) => {
+                wines = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderWineInventory(); 
+                renderTransactionsList(); 
+            }, (error) => {
+                console.error("Error listening to wines:", error);
+                showNotification(`Error listening to wines data: ${error.message}`, 'bg-red-500');
+            });
+
+            // 2. Transactions Listener
+            const transactionQuery = query(collection(db, getTransactionPath(userId)), orderBy('date', 'desc')); 
+            if (transactionUnsubscribe) transactionUnsubscribe();
+            transactionUnsubscribe = onSnapshot(transactionQuery, (snapshot) => {
+                transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderTransactionsList();
+                if (document.getElementById('tab-content-reports').classList.contains('hidden') === false) {
+                     generateReports();
+                }
+            }, (error) => {
+                console.error("Error listening to transactions:", error);
+                showNotification(`Error listening to transactions data: ${error.message}`, 'bg-red-500');
+            });
+        };
+
+        // --- UI RENDERING ---
+        
+        const showNotification = (message, colorClass = 'bg-green-500') => {
+            const container = document.getElementById('notification-container');
+            const notification = document.createElement('div');
+            notification.className = `p-3 rounded-lg text-white shadow-lg mb-3 ${colorClass}`;
+            notification.textContent = message;
+            container.appendChild(notification);
+            setTimeout(() => {
+                notification.remove();
+            }, 5000);
+        };
+
+        const setActiveTab = (tabId) => {
+            const tabs = ['inventory', 'transactions', 'reports'];
+            tabs.forEach(id => {
+                const button = document.getElementById(`tab-btn-${id}`);
+                const content = document.getElementById(`tab-content-${id}`);
+                if (id === tabId) {
+                    button.classList.add('bg-blue-600', 'text-white');
+                    button.classList.remove('text-blue-600', 'hover:bg-blue-100');
+                    content.classList.remove('hidden');
+                    if (id === 'reports') {
+                        generateReports();
+                    }
+                } else {
+                    button.classList.remove('bg-blue-600', 'text-white');
+                    button.classList.add('text-blue-600', 'hover:bg-blue-100');
+                    content.classList.add('hidden');
+                }
+            });
+        };
+
+        const renderWineInventory = () => {
+            const tableBody = document.getElementById('inventory-table-body');
+            tableBody.innerHTML = '';
+
+            if (wines.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="8" class="p-4 text-center text-gray-500">No wines added yet. Use the form above to add one.</td></tr>';
+                return;
+            }
+
+            wines.sort((a, b) => a.name.localeCompare(b.name)).forEach(wine => {
+                const row = tableBody.insertRow();
+                row.className = "hover:bg-gray-50 transition-colors";
+                row.innerHTML = `
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${wine.name}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${wine.supplier}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${wine.year || 'N/A'}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${formatCurrency(wine.cost)}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${formatCurrency(wine.sellingPrice)}</td>
+                    <td class="p-3 whitespace-nowrap font-bold text-sm ${wine.currentStock <= 0 ? 'text-red-500' : 'text-green-600'}">${formatNumber(wine.currentStock)}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">
+                        <button onclick="editWineDetails('${wine.id}')" class="text-blue-500 hover:text-blue-700 font-medium p-1 rounded transition-colors">Edit</button>
+                    </td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">
+                        <button onclick="deleteWine('${wine.id}')" class="text-red-500 hover:text-red-700 font-medium p-1 rounded transition-colors">Remove</button>
+                    </td>
+                `;
+            });
+        };
+
+        const renderTransactionsList = () => {
+            const tableBody = document.getElementById('transaction-table-body');
+            tableBody.innerHTML = '';
+
+            if (transactions.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="5" class="p-4 text-center text-gray-500">No transactions recorded yet.</td></tr>';
+            }
+
+            transactions.forEach(tx => {
+                const wine = wines.find(w => w.id === tx.wineId);
+                const row = tableBody.insertRow();
+                const typeClass = tx.type === 'SALE' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700';
+
+                // Determine the price to display: selling price for sales, cost for receivables
+                const priceDisplay = tx.unitPrice; // Price recorded at time of transaction
+
+                row.innerHTML = `
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${formatDate(tx.date)}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${wine ? wine.name : 'Unknown Wine'}</td>
+                    <td class="p-3 whitespace-nowrap text-sm font-medium">
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${typeClass}">
+                            ${tx.type}
+                        </span>
+                    </td>
+                    <td class="p-3 whitespace-nowrap text-sm font-semibold">${tx.type === 'SALE' ? '-' : '+'}${formatNumber(Math.abs(tx.quantity))}</td>
+                    <td class="p-3 whitespace-nowrap text-sm text-gray-800">${formatCurrency(priceDisplay)}</td>
+                `;
+            });
+
+            // Update wine selector options (THIS IS WHAT POPULATES THE DROPDOWN)
+            const wineSelector = document.getElementById('transaction-wine-id');
+            const selectedValue = wineSelector.value;
+            wineSelector.innerHTML = '<option value="" disabled selected>Select Wine</option>';
+            wines.sort((a, b) => a.name.localeCompare(b.name)).forEach(wine => {
+                const option = document.createElement('option');
+                option.value = wine.id;
+                option.textContent = `${wine.name} (${wine.supplier})`;
+                wineSelector.appendChild(option);
+            });
+            wineSelector.value = selectedValue; // Restore selected value if possible
+        };
+        
+        // --- INVENTORY MANAGEMENT (CRUD) ---
+
+        window.addOrUpdateWine = async (event) => {
+            event.preventDefault();
+
+            // FIX: GUARD CLAUSE
+            if (!isAuthReady || !userId) {
+                showNotification('App is still connecting to the database. Please wait a moment and try again.', 'bg-yellow-500');
+                return;
+            }
+
+            const form = event.target;
+            const id = form['wine-id'].value;
+            const name = form['wine-name'].value.trim();
+            const supplier = form['supplier'].value.trim();
+            const year = form['year'].value.trim();
+            const cost = parseFloat(form['cost'].value);
+            const sellingPrice = parseFloat(form['selling-price'].value);
+            const currentStock = parseFloat(form['current-stock-edit'].value); 
+
+            if (!name || !supplier || isNaN(cost) || isNaN(sellingPrice) || isNaN(currentStock) || cost < 0 || sellingPrice < 0 || currentStock < 0) {
+                showNotification('Please fill all required fields with valid, non-negative numbers for prices/stock.', 'bg-yellow-500');
+                return;
+            }
+
+            const wineData = {
+                name,
+                supplier,
+                year: year || 'N/A',
+                cost: cost,
+                sellingPrice: sellingPrice,
+                currentStock: currentStock, 
+                lastUpdated: serverTimestamp()
+            };
+
+            const wineCollectionPath = getWinePath(userId);
+
+            try {
+                if (id) {
+                    await setDoc(doc(db, wineCollectionPath, id), wineData, { merge: true });
+                    showNotification(`Wine "${name}" updated successfully.`, 'bg-blue-500');
+                } else {
+                    wineData.createdAt = serverTimestamp();
+                    await addDoc(collection(db, wineCollectionPath), wineData);
+                    showNotification(`Wine "${name}" added successfully.`, 'bg-green-500');
+                }
+                document.getElementById('add-wine-form').reset();
+                document.getElementById('wine-id').value = '';
+                document.getElementById('add-wine-button').textContent = 'Add Wine';
+                document.getElementById('current-stock-edit-label').textContent = 'Initial Stock (Qty)'; // Reset label
+
+            } catch (error) {
+                console.error("Error adding/updating wine:", error);
+                showNotification(`Error saving wine: ${error.message}`, 'bg-red-500');
+            }
+        };
+
+        window.editWineDetails = (wineId) => {
+            const wine = wines.find(w => w.id === wineId);
+            if (!wine) return;
+
+            // Scroll to the form
+            document.getElementById('add-wine-form').scrollIntoView({ behavior: 'smooth' });
+
+            // Populate form for editing
+            document.getElementById('wine-id').value = wine.id;
+            document.getElementById('wine-name').value = wine.name;
+            document.getElementById('supplier').value = wine.supplier;
+            document.getElementById('year').value = wine.year === 'N/A' ? '' : wine.year;
+            document.getElementById('cost').value = wine.cost;
+            document.getElementById('selling-price').value = wine.sellingPrice;
+            document.getElementById('current-stock-edit').value = wine.currentStock; // Set to current stock
+            document.getElementById('current-stock-edit-label').textContent = 'Current Stock (Editable)';
+            document.getElementById('add-wine-button').textContent = 'Update Wine Details';
+        };
+
+        window.deleteWine = async (wineId) => {
+             // FIX: GUARD CLAUSE
+            if (!isAuthReady || !userId) {
+                showNotification('App is not connected to the database. Please wait.', 'bg-yellow-500');
+                return;
+            }
+            
+            const wineToDelete = wines.find(w => w.id === wineId)?.name || 'this wine';
+            if (!window.confirm(`WARNING: Are you sure you want to permanently delete "${wineToDelete}"? This action CANNOT be undone.`)) {
+                return;
+            }
+
+            try {
+                await deleteDoc(doc(db, getWinePath(userId), wineId));
+                showNotification(`Wine successfully deleted.`, 'bg-red-500');
+            } catch (error) {
+                console.error("Error deleting wine:", error);
+                showNotification(`Error deleting wine: ${error.message}`, 'bg-red-500');
+            }
+        };
+
+        // --- TRANSACTION INPUT ---
+
+        window.recordTransaction = async (event) => {
+            event.preventDefault();
+
+            // FIX: GUARD CLAUSE
+            if (!isAuthReady || !userId) {
+                showNotification('App is still connecting to the database. Please wait a moment and try again.', 'bg-yellow-500');
+                return;
+            }
+
+            const form = event.target;
+            const wineId = form['transaction-wine-id'].value;
+            const type = form['transaction-type'].value;
+            const quantity = parseFloat(form['transaction-quantity'].value);
+            const dateInput = form['transaction-date'];
+
+            if (!wineId || !type || isNaN(quantity) || quantity <= 0.09 || !dateInput.value) {
+                showNotification('Please select a wine, transaction type, and input a valid quantity (minimum 0.1) and date.', 'bg-yellow-500');
+                return;
+            }
+
+            const transactionDate = new Date(dateInput.value);
+            const wineDocRef = doc(db, getWinePath(userId), wineId);
+            const transactionCollectionPath = getTransactionPath(userId);
+
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const wineDoc = await transaction.get(wineDocRef);
+                    if (!wineDoc.exists()) {
+                        throw new Error("Wine does not exist!");
+                    }
+                    const wineData = wineDoc.data();
+                    let newStock = wineData.currentStock;
+                    let transactionQuantity = quantity;
+                    const quantityForUpdate = quantity;
+
+                    if (type === 'SALE') {
+                        if (newStock < quantityForUpdate) {
+                            throw new Error(`Insufficient stock! Only ${formatNumber(newStock)} available for sale.`);
+                        }
+                        newStock -= quantityForUpdate;
+                        transactionQuantity = -quantityForUpdate; 
+                    } else if (type === 'RECEIVABLE') {
+                        newStock += quantityForUpdate;
+                    }
+
+                    // 1. Update Wine Stock
+                    transaction.update(wineDocRef, {
+                        currentStock: newStock,
+                        lastUpdated: serverTimestamp()
+                    });
+
+                    // 2. Add Transaction Record
+                    const priceToRecord = type === 'SALE' ? wineData.sellingPrice : wineData.cost;
+                    
+                    const newTransaction = {
+                        wineId,
+                        type,
+                        quantity: transactionQuantity, 
+                        unitPrice: priceToRecord, 
+                        date: transactionDate, 
+                        createdAt: serverTimestamp()
+                    };
+                    transaction.set(doc(collection(db, transactionCollectionPath)), newTransaction);
+                });
+
+                showNotification(`${type} of ${formatNumber(quantity)} units recorded successfully!`, 'bg-green-500');
+                form.reset();
+                dateInput.valueAsDate = new Date(); // Reset date to today
+                
+            } catch (error) {
+                console.error("Transaction failed:", error);
+                const msg = error instanceof Error ? error.message : (typeof error === 'string' ? error : 'An unknown error occurred during transaction.');
+                showNotification(`Transaction Failed: ${msg}`, 'bg-red-500');
+            }
+        };
+
+        // --- REPORTS GENERATION (End of Month Balance/P&L) ---
+
+        const generateReports = () => {
+            const reportContainer = document.getElementById('report-metrics');
+            reportContainer.innerHTML = '<p class="text-center text-lg text-blue-600">Calculating reports...</p>';
+
+            if (wines.length === 0) {
+                reportContainer.innerHTML = '<p class="text-center text-red-500">Inventory is empty. Cannot generate reports.</p>';
+                return;
+            }
+
+            // --- 1. Define Reporting Period (Last 30 days) ---
+            const today = new Date();
+            const thirtyDaysAgo = new Date(today);
+            thirtyDaysAgo.setDate(today.getDate() - 30);
+            
+            const recentTransactions = transactions.filter(tx => {
+                const txDate = tx.date.toDate ? tx.date.toDate() : new Date(tx.date);
+                return txDate >= thirtyDaysAgo;
+            });
+
+            // --- 2. Calculate Aggregates ---
+            let totalProfit = 0;
+            let totalOrderCost = 0;
+            const salesByWine = {}; 
+
+            recentTransactions.forEach(tx => {
+                const wine = wines.find(w => w.id === tx.wineId);
+                if (!wine) return; 
+
+                const quantity = Math.abs(tx.quantity); 
+
+                if (tx.type === 'SALE') {
+                    // Use the unit cost from the wine inventory to calculate profit
+                    const profitPerUnit = tx.unitPrice - wine.cost; 
+                    totalProfit += profitPerUnit * quantity;
+
+                    salesByWine[tx.wineId] = (salesByWine[tx.wineId] || 0) + quantity;
+                } else if (tx.type === 'RECEIVABLE') {
+                    totalOrderCost += tx.unitPrice * quantity; 
+                }
+            });
+
+            // --- 3. Calculate Closing Inventory Value ---
+            let closingInventoryValue = 0;
+            wines.forEach(wine => {
+                closingInventoryValue += wine.currentStock * wine.cost;
+            });
+
+            // --- 4. Top/Weak Sales Wines ---
+            const sortedSales = Object.entries(salesByWine)
+                .map(([id, quantity]) => ({
+                    wine: wines.find(w => w.id === id)?.name || 'Unknown',
+                    quantity
+                }))
+                .sort((a, b) => b.quantity - a.quantity);
+
+            const topSales = sortedSales.slice(0, 3);
+            const weakSales = sortedSales.length > 3 ? sortedSales.slice(-3).reverse() : []; 
+
+            // --- 5. Render Report ---
+            reportContainer.innerHTML = `
+                <div class="space-y-6">
+                    <h3 class="text-2xl font-bold text-gray-800 border-b pb-2">End-of-Month P&L and Closing Inventory Report</h3>
+                    <p class="text-sm text-gray-500">Analysis period: Last 30 days (${formatDate(thirtyDaysAgo)} to ${formatDate(today)})</p>
+
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <!-- Metric Card: Profit -->
+                        <div class="bg-white p-5 rounded-xl shadow-lg border-l-4 border-green-500">
+                            <p class="text-sm font-medium text-gray-500">Profit from Sales</p>
+                            <p class="text-3xl font-extrabold text-green-700">${formatCurrency(totalProfit)}</p>
+                        </div>
+                        <!-- Metric Card: Order Cost -->
+                        <div class="bg-white p-5 rounded-xl shadow-lg border-l-4 border-red-500">
+                            <p class="text-sm font-medium text-gray-500">Total Order Cost (Purchases)</p>
+                            <p class="text-3xl font-extrabold text-red-700">${formatCurrency(totalOrderCost)}</p>
+                        </div>
+                        <!-- Metric Card: Closing Inventory Value -->
+                        <div class="bg-white p-5 rounded-xl shadow-lg border-l-4 border-blue-500">
+                            <p class="text-sm font-medium text-gray-500">Closing Inventory Value (Cost)</p>
+                            <p class="text-3xl font-extrabold text-blue-700">${formatCurrency(closingInventoryValue)}</p>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4">
+                        <!-- Top Sales Wines -->
+                        <div class="bg-white p-5 rounded-xl shadow-lg border-t-4 border-purple-500">
+                            <h4 class="text-xl font-semibold mb-3 text-purple-700">Top 3 Sales Wines (by Qty Sold)</h4>
+                            <ul class="space-y-2">
+                                ${topSales.map(item => `<li class="flex justify-between border-b pb-1 last:border-b-0">
+                                    <span class="text-gray-700">${item.wine}</span>
+                                    <span class="font-mono text-purple-600">${formatNumber(item.quantity)} units</span>
+                                </li>`).join('')}
+                                ${topSales.length === 0 ? '<li class="text-gray-500">No sales recorded this period.</li>' : ''}
+                            </ul>
+                        </div>
+                        <!-- Weak Sales Wines -->
+                        <div class="bg-white p-5 rounded-xl shadow-lg border-t-4 border-orange-500">
+                            <h4 class="text-xl font-semibold mb-3 text-orange-700">Weak Sales Wines (by Qty Sold)</h4>
+                            <ul class="space-y-2">
+                                ${weakSales.map(item => `<li class="flex justify-between border-b pb-1 last:border-b-0">
+                                    <span class="text-gray-700">${item.wine}</span>
+                                    <span class="font-mono text-orange-600">${formatNumber(item.quantity)} units</span>
+                                </li>`).join('')}
+                                ${weakSales.length === 0 ? '<li class="text-gray-500">Insufficient sales data to determine weak sellers.</li>' : ''}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- INITIALIZATION ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeFirebase();
+            setActiveTab('inventory'); // Set default tab
+            window.setActiveTab = setActiveTab; // Expose to window for use in HTML buttons
+            document.getElementById('transaction-date').valueAsDate = new Date(); // Set default date
+        });
+
+        // Expose functions for HTML access
+        window.editWineDetails = window.editWineDetails;
+        window.deleteWine = window.deleteWine;
+        window.recordTransaction = window.recordTransaction; 
+        window.addOrUpdateWine = window.addOrUpdateWine; 
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fc; }
+        .tab-btn { transition: all 0.3s; }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-8">
+
+    <div id="notification-container" class="fixed top-4 right-4 z-50 max-w-xs w-full"></div>
+
+    <div class="max-w-7xl mx-auto bg-white rounded-2xl shadow-2xl p-4 md:p-8">
+        <header class="mb-6 border-b pb-4 flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-extrabold text-gray-900">Wine Inventory & Ledger</h1>
+                <p id="user-id-display" class="text-xs text-gray-500 mt-1"></p>
+            </div>
+            <div id="db-status" class="px-3 py-1 text-sm font-semibold rounded-full text-white bg-gray-400 shadow-md">Loading...</div>
+        </header>
+
+        <!-- Tabs Navigation -->
+        <div class="flex border-b border-gray-200 mb-6">
+            <button id="tab-btn-inventory" onclick="setActiveTab('inventory')" class="tab-btn py-2 px-4 text-sm font-medium rounded-t-lg">Inventory Management</button>
+            <button id="tab-btn-transactions" onclick="setActiveTab('transactions')" class="tab-btn py-2 px-4 text-sm font-medium rounded-t-lg">Record Transaction</button>
+            <button id="tab-btn-reports" onclick="setActiveTab('reports')" class="tab-btn py-2 px-4 text-sm font-medium rounded-t-lg">Month-End Reports</button>
+        </div>
+
+        <!-- Tab Content: Inventory Management -->
+        <div id="tab-content-inventory" class="space-y-8">
+            <h2 class="text-2xl font-semibold text-gray-800">1. Add or Update Wine Details</h2>
+
+            <!-- Add/Edit Wine Form -->
+            <div class="bg-gray-50 p-6 rounded-xl shadow-inner">
+                <form id="add-wine-form" onsubmit="addOrUpdateWine(event)">
+                    <input type="hidden" id="wine-id" name="wine-id">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div class="col-span-1 md:col-span-2">
+                            <label for="wine-name" class="block text-sm font-medium text-gray-700">Wine Name</label>
+                            <input type="text" id="wine-name" name="wine-name" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label for="supplier" class="block text-sm font-medium text-gray-700">Supplier</label>
+                            <input type="text" id="supplier" name="supplier" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label for="year" class="block text-sm font-medium text-gray-700">Year (Optional)</label>
+                            <input type="text" id="year" name="year" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label for="cost" class="block text-sm font-medium text-gray-700">Unit Cost ($)</label>
+                            <input type="number" step="0.01" min="0" id="cost" name="cost" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label for="selling-price" class="block text-sm font-medium text-gray-700">Selling Price ($)</label>
+                            <input type="number" step="0.01" min="0" id="selling-price" name="selling-price" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label for="current-stock-edit" id="current-stock-edit-label" class="block text-sm font-medium text-gray-700">Initial Stock (Qty)</label>
+                            <input type="number" step="0.1" min="0" id="current-stock-edit" name="current-stock-edit" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                    </div>
+                    <div class="mt-6 flex justify-end">
+                        <button type="submit" id="add-wine-button" class="px-6 py-2 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition-colors">Add Wine</button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Inventory Table -->
+            <h3 class="text-xl font-semibold text-gray-800 pt-4">Current Wine Inventory</h3>
+            <div class="overflow-x-auto shadow-xl rounded-xl border">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Wine Name</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Supplier</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Year</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Cost ($)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Sell Price ($)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Stock (Qty)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" colspan="2">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inventory-table-body" class="bg-white divide-y divide-gray-200">
+                        <!-- Inventory rows will be injected here -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Tab Content: Record Transaction -->
+        <div id="tab-content-transactions" class="hidden space-y-8">
+            <h2 class="text-2xl font-semibold text-gray-800">2. Input Receivable & Sales Entries</h2>
+
+            <!-- Transaction Form -->
+            <div class="bg-gray-50 p-6 rounded-xl shadow-inner">
+                <form id="transaction-form" onsubmit="recordTransaction(event)">
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <!-- Wine Selector -->
+                        <div>
+                            <label for="transaction-wine-id" class="block text-sm font-medium text-gray-700">Select Wine</label>
+                            <select id="transaction-wine-id" name="transaction-wine-id" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                                <option value="" disabled selected>Select Wine</option>
+                            </select>
+                        </div>
+                        <!-- Transaction Type -->
+                        <div>
+                            <label for="transaction-type" class="block text-sm font-medium text-gray-700">Transaction Type</label>
+                            <select id="transaction-type" name="transaction-type" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                                <option value="SALE">Sale (Inventory Out)</option>
+                                <option value="RECEIVABLE">Receivable (Inventory In)</option>
+                            </select>
+                        </div>
+                        <!-- Quantity -->
+                        <div>
+                            <label for="transaction-quantity" class="block text-sm font-medium text-gray-700">Quantity (Qty)</label>
+                            <input type="number" step="0.1" min="0.1" id="transaction-quantity" name="transaction-quantity" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <!-- Date -->
+                        <div>
+                            <label for="transaction-date" class="block text-sm font-medium text-gray-700">Date</label>
+                            <input type="date" id="transaction-date" name="transaction-date" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2 focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                    </div>
+                    <div class="mt-6 flex justify-end">
+                        <button type="submit" class="px-6 py-2 bg-green-600 text-white font-semibold rounded-lg shadow-md hover:bg-green-700 transition-colors">Record Entry</button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Transactions List -->
+            <h3 class="text-xl font-semibold text-gray-800 pt-4">Recent Transactions</h3>
+            <div class="overflow-x-auto shadow-xl rounded-xl border">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Wine</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Quantity</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Unit Price</th>
+                        </tr>
+                    </thead>
+                    <tbody id="transaction-table-body" class="bg-white divide-y divide-gray-200">
+                        <!-- Transaction rows will be injected here -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Tab Content: Reports -->
+        <div id="tab-content-reports" class="hidden space-y-8">
+            <h2 class="text-2xl font-semibold text-gray-800">3. Month-End Balance & Profit/Loss Report</h2>
+
+            <div id="report-metrics" class="bg-gray-50 p-6 rounded-xl shadow-inner">
+                <p class="text-center text-lg text-gray-500">Click the "Month-End Reports" tab to generate the current period's report.</p>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>                    ...wine,
                     createdAt: serverTimestamp(),
                     lastUpdated: serverTimestamp()
                 };
@@ -709,3 +1374,4 @@
 </body>
 
 </html>
+
